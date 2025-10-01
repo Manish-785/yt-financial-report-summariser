@@ -1,0 +1,11 @@
+streamlit
+youtube-transcript-api
+yt-dlp
+openai-whisper
+ollama
+fpdf2
+pandas
+spacy
+fuzzywuzzy
+python-Levenshtein
+requests
