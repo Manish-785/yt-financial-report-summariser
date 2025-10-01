@@ -9,6 +9,8 @@ from utils.summarization import generate_summary
 import pandas as pd
 import re
 from thefuzz import process
+from dotenv import load_dotenv
+load_dotenv()
 
 SIMILARITY_THRESHOLD = 85
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
