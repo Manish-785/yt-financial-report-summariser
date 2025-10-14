@@ -62,7 +62,7 @@ def summarise_with_gpt(text, PROMPT_TEMPLATE, api_key=None, model="gpt-5-mini", 
             return result["choices"][0]["message"]["content"].strip()
         except Exception as e:
             logger.warning(f"[GPT] Attempt {attempt + 1} failed: {e}")
-            time.sleep(5 * (attempt + 1))
+            time.sleep(5)
     return None
 
 @st.cache_data

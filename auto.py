@@ -8,12 +8,13 @@ from utils.transcription import get_transcript
 from utils.summarization import generate_summary
 import pandas as pd
 import re
-from thefuzz import process
+from thefuzz import process,fuzz
 from dotenv import load_dotenv
 load_dotenv()
 
-SIMILARITY_THRESHOLD = 85
+SIMILARITY_THRESHOLD = 80
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # 👇 Add your YouTube channel IDs here
 CHANNEL_IDS = [
@@ -26,15 +27,10 @@ CHANNEL_IDS = [
 
 VISITED_LOG = "visited_videos.json"
 
-# Load spaCy small English model
-nlp = spacy.load("en_core_web_sm")
-
-
 def fetch_latest_videos(channel_id, max_videos=3):
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id.strip()}"
     feed = feedparser.parse(rss_url)
     return [(entry.link, entry.title) for entry in feed.entries[:max_videos]]
-
 
 def send_to_slack(text):
     if not SLACK_WEBHOOK_URL:
@@ -43,89 +39,249 @@ def send_to_slack(text):
     payload = {"text": text}
     requests.post(SLACK_WEBHOOK_URL, json=payload)
 
-
 def load_visited():
     if os.path.exists(VISITED_LOG):
         with open(VISITED_LOG, "r") as f:
             return set(json.load(f))
     return set()
 
-
 def save_visited(visited):
     with open(VISITED_LOG, "w") as f:
         json.dump(list(visited), f)
 
-def load_company_data(filepath="comp.csv"):
-    """Loads the company names from the provided CSV file."""
+def load_company_data(filepath="accord_bse_mapping.xlsx"):
+    """Loads the company data from the Excel file."""
     try:
-        df = pd.read_csv(filepath)
-        company_names = df['Company Name'].dropna().tolist()
-        company_names_lower = [name.lower() for name in company_names]
-        name_map = dict(zip(company_names_lower, company_names))
-        return company_names_lower, name_map
+        df = pd.read_excel(filepath)
+        print(f"Successfully loaded {filepath}")
+        
+        # Create a searchable dataset with company names and their variations
+        company_data = {}
+        for _, row in df.iterrows():
+            company_name = str(row['Company Name']).strip()
+            if pd.notna(company_name) and company_name.lower() != 'nan':
+                company_info = {
+                    'company_name': company_name,
+                    'accord_code': row.get('Accord Code', ''),
+                    'bse_code': row.get('CD_BSE Code', ''),
+                    'nse_symbol': row.get('CD_NSE Symbol', ''),
+                    'isin': row.get('CD_ISIN No', ''),
+                    'sector': row.get('CD_Sector', ''),
+                    'industry': row.get('CD_Industry1', '')
+                }
+                # Store with original name as key
+                company_data[company_name.lower()] = company_info
+                
+        return company_data
+        
     except FileNotFoundError:
         print(f"Error: The file '{filepath}' was not found.")
-        return [], {}
-    except KeyError:
-        print("Error: The CSV must have a column named 'Company Name'. Please check your file.")
-        return [], {}
+        return {}
+    except Exception as e:
+        print(f"Error loading company data: {e}")
+        return {}
 
-COMPANY_NAMES_LOWER, COMPANY_NAME_MAP = load_company_data()
+COMPANY_DATA = load_company_data()
 
-FINANCIAL_STOP_WORDS = {
-    "earnings", "report", "call", "guidance", "analysis", "stock", "stocks",
-    "market", "quarter", "investing", "finance", "inc", "company", "corporation",
-    "ltd", "limited", "industries"
-}
-
-
-def extract_company_names(title: str) -> list[str]:
+def extract_companies_with_gpt(title: str, api_key=None, model="gpt-5-mini", max_retries=3) -> list[str]:
     """
-    Extracts Indian and international company names using Noun Chunks and fuzzy matching.
+    Uses GPT to extract company names and their common aliases from the title.
     """
-    if not COMPANY_NAMES_LOWER:
-        print("Company list is not loaded. Cannot extract names.")
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("OPENAI_API_KEY not set")
         return []
-
-    found_companies = set()
-    doc = nlp(title)
-
-    candidates = [chunk.text for chunk in doc.noun_chunks]
     
-    # Use Fuzzy Matching for each candidate
-    for candidate in candidates:
-        candidate_lower = candidate.lower()
+    prompt = f"""
+You are a financial analyst tasked with identifying Indian company names from YouTube video titles.
 
-        # Simple filter for very short or irrelevant chunks
-        if len(candidate_lower.split()) > 5 or len(candidate_lower) < 3:
-            continue
+Given this video title: "{title}"
+
+Extract any Indian company names mentioned. Consider common abbreviations and aliases:
+- HPCL = Hindustan Petroleum Corporation Limited
+- ONGC = Oil and Natural Gas Corporation
+- L&T = Larsen & Toubro
+- TCS = Tata Consultancy Services
+- HDFC = Housing Development Finance Corporation
+- ICICI = Industrial Credit and Investment Corporation of India
+- SBI = State Bank of India
+- ITC = Indian Tobacco Company
+- M&M = Mahindra & Mahindra
+- HUL = Hindustan Unilever Limited
+- RIL = Reliance Industries Limited
+- Adani = Adani Group companies
+- Tata = Tata Group companies
+- Bajaj = Bajaj Group companies
+- Maruti = Maruti Suzuki India Limited
+
+IMPORTANT: Do NOT include news channels, media companies, or YouTube channel names such as:
+- ZEE Business, ZEE News, ZEE TV
+- CNBC, CNBC News, CNBC TV18
+- ET Now, Economic Times
+- Bloomberg, Reuters
+- Moneycontrol
+- Business Standard
+- Times Now
+- News18
+- NDTV
+- Any other news/media organizations
+
+Return ONLY the full company names (not abbreviations) of actual Indian businesses/corporations that you can identify with high confidence.
+If no Indian companies are mentioned, return an empty list.
+Format your response as a JSON array of strings.
+
+Example response: ["Reliance Industries Limited", "Tata Consultancy Services"]
+"""
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a precise financial analyst. Only identify Indian companies you are confident about. Avoid hallucination."},
+            {"role": "user", "content": prompt}
+        ],
+    }
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            response_content = result["choices"][0]["message"]["content"].strip()
             
-        # Remove common stop words from the candidate to improve matching
-        # e.g., "reliance industries stock" -> "reliance"
-        filtered_candidate_parts = [word for word in candidate_lower.split() if word not in FINANCIAL_STOP_WORDS]
-        if not filtered_candidate_parts:
-            continue
-        filtered_candidate = " ".join(filtered_candidate_parts)
+            # Parse JSON response
+            companies = json.loads(response_content)
+            return companies if isinstance(companies, list) else []
+            
+        except Exception as e:
+            print(f"[GPT] Attempt {attempt + 1} failed: {e}")
+            time.sleep(1)
+    
+    return []
 
-        # Find the best match from our loaded list
-        best_match = process.extractOne(filtered_candidate, COMPANY_NAMES_LOWER)
+def find_companies_in_data(gpt_companies: list[str]) -> list[dict]:
+    """
+    Matches GPT-extracted company names against the database using a more robust method.
 
-        # Apply the threshold
-        if best_match and best_match[1] >= SIMILARITY_THRESHOLD:
-            # We found a good match. Use the correctly cased name from our map.
-            official_name = COMPANY_NAME_MAP[best_match[0]]
-            found_companies.add(official_name)
+    This function simplifies the matching logic:
+    1. For each company name from GPT, generate a set of normalized variations (e.g., "Ltd", "Limited", etc.).
+    2. Find the single best fuzzy match from the entire database against these variations.
+    3. If this best match's score is above the confidence threshold, accept it.
+    
+    This avoids prematurely accepting a high-scoring incorrect match.
+    """
+    found_companies = []
+    
+    # --- Pre-normalization setup (run once) ---
+    normalized_company_data = {}
+    for original_key, info in COMPANY_DATA.items():
+        normalized_key = re.sub(r'\s+', ' ', original_key.lower().strip().rstrip('.')).strip()
+        if normalized_key:
+            normalized_company_data[normalized_key] = info
+    
+    company_names_from_db_normalized = list(normalized_company_data.keys())
 
-    return list(found_companies)
+    # --- Main matching loop ---
+    for gpt_company in gpt_companies:
+        print(f"[MATCHING] Searching for: '{gpt_company}'")
+
+        # --- Step 1: Generate all possible variations of the input name ---
+        base_normalized = re.sub(r'\s+', ' ', gpt_company.lower().strip().rstrip('.')).strip()
+        
+        # Use a set to automatically handle duplicate variations
+        candidates = {base_normalized}
+        
+        variations_to_try = [
+            base_normalized.replace(" limited", " ltd"),
+            base_normalized.replace(" ltd", " limited"),
+            base_normalized.replace(" corporation", " corp"),
+            base_normalized.replace(" corp", " corporation"),
+            re.sub(r'\s+(limited|ltd|corporation|corp|private|pvt|india|group)$', '', base_normalized).strip(),
+        ]
+        
+        for var in variations_to_try:
+            clean_var = re.sub(r'\s+', ' ', var).strip()
+            if clean_var and clean_var not in candidates:
+                candidates.add(clean_var)
+        
+        print(f"  - Generated candidates: {list(candidates)}")
+
+        # --- Step 2: Find the single best match across all candidates ---
+        # We use process.extractOne with a more suitable scorer for this task.
+        # fuzz.token_sort_ratio is good at ignoring differences like "Ltd" vs "Limited".
+        best_match_result = process.extractOne(
+            base_normalized,
+            company_names_from_db_normalized,
+            scorer=fuzz.token_sort_ratio, # Using a more robust scorer
+            score_cutoff=SIMILARITY_THRESHOLD
+        )
+        
+        # --- Step 3: Evaluate the best match found ---
+        if best_match_result:
+            matched_db_key, score = best_match_result
+            matched_company_data = normalized_company_data[matched_db_key]
+            
+            print(f"  [SUCCESS] Best match found with score {score}: '{gpt_company}' -> '{matched_company_data['company_name']}'")
+            found_companies.append(matched_company_data)
+        else:
+            print(f"  [NO MATCH] Could not find a match above threshold {SIMILARITY_THRESHOLD} for '{gpt_company}'")
+
+    # --- Final deduplication ---
+    unique_companies = {}
+    for company in found_companies:
+        isin = company.get('isin')
+        if isin and isin not in unique_companies:
+            unique_companies[isin] = company
+            
+    return list(unique_companies.values())
+
+def test_title_extraction(title: str):
+    """
+    Test function to check company extraction from a given title.
+    """
+    print(f"Testing title: '{title}'")
+    
+    # Extract companies using GPT
+    print("\n--- GPT Company Extraction ---")
+    gpt_companies = extract_companies_with_gpt(title)
+    print(f"GPT extracted companies: {gpt_companies}")
+    
+    if not gpt_companies:
+        print("No companies found by GPT")
+        return
+    
+    # Find companies in our Excel data
+    print("\n--- Company Matching ---")
+    companies_info = find_companies_in_data(gpt_companies)
+    print(f"Matched companies in database: {len(companies_info)}")
+    
+    for company in companies_info:
+        print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
+    
+    if not companies_info:
+        print("No companies matched in database")
 
 
-def format_summary_for_slack(url, summary, channel_id, title, companies):
+def format_summary_for_slack(url, summary, channel_id, title, companies_info):
     lines = []
     lines.append(f"*Summary for channel:* `{channel_id}`\n<{url}>")
     lines.append(f"*Video Title:* {title}")
     
-    if companies:
-        lines.append(f"*Detected Companies:* {', '.join(companies)}\n")
+    if companies_info:
+        lines.append("*Detected Companies:*")
+        for company_info in companies_info:
+            company_line = f"• {company_info['company_name']}"
+            if company_info.get('isin'):
+                company_line += f" (ISIN: {company_info['isin']})"
+            if company_info.get('nse_symbol'):
+                company_line += f" (NSE: {company_info['nse_symbol']})"
+            lines.append(company_line)
+        lines.append("")
     
     # Executive Summary - only add if exists and not empty
     exec_summary = summary.get('executive_summary')
@@ -181,24 +337,229 @@ def main():
                 if url in visited_videos:
                     continue
 
-                companies = extract_company_names(title)
-                if not companies:
-                    print(f"Skipping (no company found): {title}")
+                # Use GPT to extract company names
+                gpt_companies = extract_companies_with_gpt(title)
+                if not gpt_companies:
+                    print(f"Skipping (no companies found by GPT): {title}")
+                    continue
+                
+                # Find companies in our Excel data
+                companies_info = find_companies_in_data(gpt_companies)
+                if not companies_info:
+                    print(f"Skipping (no companies matched in database): {title}")
                     continue
 
-                print(f"Processing: {title} ({url}) from channel {channel_id}, Companies: {companies}")
+                company_names = [info['company_name'] for info in companies_info]
+                print(f"Processing: {title} ({url}) from channel {channel_id}, Companies: {company_names}")
+                
                 try:
                     transcript = get_transcript(url)
                     summary = generate_summary(transcript)
-                    summary_text = format_summary_for_slack(url, summary, channel_id, title, companies)
+                    summary_text = format_summary_for_slack(url, summary, channel_id, title, companies_info)
                     send_to_slack(summary_text)
                     visited_videos.add(url)
                 except Exception as e:
                     print(f"Error processing {url}: {e}")
                     continue
+                    
         save_visited(visited_videos)
         time.sleep(600)  # Wait 10 minutes before checking again
 
+def test_single_video(video_url: str, test_title: str = None):
+    """
+    Test function to process a single video URL for debugging purposes.
+    Can optionally use a provided title instead of extracting from transcript.
+    """
+    print(f"Testing video: {video_url}")
+    
+    try:
+        # Use provided title or extract from transcript
+        if test_title:
+            print(f"Using provided title: {test_title}")
+            title_for_extraction = test_title
+        else:
+            # Extract from transcript as fallback
+            transcript = get_transcript(video_url)
+            if not transcript:
+                print("Could not get transcript and no title provided")
+                return
+            title_for_extraction = transcript[:200] + "..."
+            print(f"Using transcript preview as title: {title_for_extraction}")
+        
+        # Extract companies using GPT
+        print("\n--- GPT Company Extraction ---")
+        gpt_companies = extract_companies_with_gpt(title_for_extraction)
+        print(f"GPT extracted companies: {gpt_companies}")
+        
+        if not gpt_companies:
+            print("No companies found by GPT")
+            return
+        
+        # Find companies in our Excel data
+        print("\n--- Company Matching ---")
+        companies_info = find_companies_in_data(gpt_companies)
+        print(f"Matched companies in database: {len(companies_info)}")
+        
+        for company in companies_info:
+            print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
+        
+        if not companies_info:
+            print("No companies matched in database")
+            return
+        
+        # Get transcript for summary generation
+        if not test_title:  # We already have transcript
+            pass
+        else:
+            print("\n--- Getting Transcript ---")
+            transcript = get_transcript(video_url)
+            if not transcript:
+                print("Could not get transcript for summary generation")
+                return
+        
+        # Generate summary
+        print("\n--- Generating Summary ---")
+        summary = generate_summary(transcript)
+        
+        # Format for Slack
+        final_title = test_title if test_title else title_for_extraction
+        summary_text = format_summary_for_slack(video_url, summary, "TEST_CHANNEL", final_title, companies_info)
+        
+        print("\n--- Final Slack Message ---")
+        print(summary_text)
+        
+        # Optionally send to Slack (uncomment if you want to test)
+        # send_to_slack(summary_text)
+        
+    except Exception as e:
+        print(f"Error testing video: {e}")
+        import traceback
+        traceback.print_exc()
+
+def test_comprehensive(video_url: str = None, title: str = None):
+    """
+    Comprehensive test function that can handle video URL, title, or both.
+    """
+    if not video_url and not title:
+        print("Please provide either a video URL, title, or both")
+        return
+    
+    if title:
+        print(f"Testing title: '{title}'")
+        
+        # Extract companies using GPT
+        print("\n--- GPT Company Extraction ---")
+        gpt_companies = extract_companies_with_gpt(title)
+        print(f"GPT extracted companies: {gpt_companies}")
+        
+        if not gpt_companies:
+            print("No companies found by GPT")
+            if not video_url:
+                return
+        else:
+            # Find companies in our Excel data
+            print("\n--- Company Matching ---")
+            companies_info = find_companies_in_data(gpt_companies)
+            print(f"Matched companies in database: {len(companies_info)}")
+            
+            for company in companies_info:
+                print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
+    
+    if video_url:
+        print(f"\nTesting video processing: {video_url}")
+        try:
+            # Get transcript
+            print("\n--- Getting Transcript ---")
+            transcript = get_transcript(video_url)
+            if not transcript:
+                print("Could not get transcript")
+                return
+            
+            # If we have companies from title, use them; otherwise extract from transcript
+            if title and 'gpt_companies' in locals() and gpt_companies:
+                print("\n--- Using companies from title ---")
+            else:
+                print("\n--- Extracting companies from transcript ---")
+                # Use first part of transcript for company extraction
+                transcript_preview = transcript[:500]
+                gpt_companies = extract_companies_with_gpt(transcript_preview)
+                print(f"GPT extracted companies: {gpt_companies}")
+                
+                if not gpt_companies:
+                    print("No companies found in transcript")
+                    return
+                
+                companies_info = find_companies_in_data(gpt_companies)
+                print(f"Matched companies in database: {len(companies_info)}")
+                
+                for company in companies_info:
+                    print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
+            
+            if not companies_info:
+                print("No companies matched in database")
+                return
+            
+            # Generate summary
+            print("\n--- Generating Summary ---")
+            summary = generate_summary(transcript)
+            
+            # Format for Slack
+            final_title = title if title else "Test Video"
+            summary_text = format_summary_for_slack(video_url, summary, "TEST_CHANNEL", final_title, companies_info)
+            
+            print("\n--- Final Slack Message ---")
+            print(summary_text)
+            
+        except Exception as e:
+            print(f"Error processing video: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "test_video" and len(sys.argv) > 2:
+            # Test a single video with optional title
+            video_url = sys.argv[2]
+            title = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else None
+            test_single_video(video_url, title)
+        elif sys.argv[1] == "test_title" and len(sys.argv) > 2:
+            # Test title extraction only
+            test_title = " ".join(sys.argv[2:])
+            test_title_extraction(test_title)
+        elif sys.argv[1] == "test" and len(sys.argv) > 2:
+            # Comprehensive test - can handle various combinations
+            args = sys.argv[2:]
+            video_url = None
+            title = None
+            
+            # Parse arguments
+            i = 0
+            while i < len(args):
+                if args[i] == "--url" and i + 1 < len(args):
+                    video_url = args[i + 1]
+                    i += 2
+                elif args[i] == "--title" and i + 1 < len(args):
+                    # Get the rest as title
+                    title = " ".join(args[i + 1:])
+                    break
+                elif args[i].startswith("http"):
+                    video_url = args[i]
+                    i += 1
+                else:
+                    # Assume it's part of the title
+                    title = " ".join(args[i:])
+                    break
+            
+            test_comprehensive(video_url, title)
+        else:
+            print("Usage:")
+            print("  python auto.py test_video <youtube_url> [title]")
+            print("  python auto.py test_title <title_text>")
+            print("  python auto.py test --url <youtube_url> --title <title_text>")
+            print("  python auto.py test <youtube_url>")
+            print("  python auto.py test --title <title_text>")
+    else:
+        # Run normal main function
+        main()        
