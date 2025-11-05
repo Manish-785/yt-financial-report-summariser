@@ -1,4 +1,3 @@
-import streamlit as st
 import json
 import os
 import requests
@@ -11,25 +10,42 @@ load_dotenv()  # Load environment variables from a .env file if present
 logger = logging.getLogger(__name__)
 
 FINANCIAL_ANALYST_PROMPT = """
-You are an expert financial analyst from a top-tier investment bank. Your task is to analyze the following earnings call transcript and provide a structured summary in JSON format. Extract the key financial metrics, summarize management's discussion, and identify any forward-looking guidance or risk factors.
+You are an expert financial analyst. Given the following transcript, identify every company mentioned and for each company return a concise JSON object with three fields: `company_name`, `speaker` and `note`.
+
+Requirements:
+- `company_name`: Full official company name as mentioned in the transcript (one string).
+- `speaker`: a short string with "Name / Designation" of the person speaking about the company (use the best available name and title from the transcript; if unknown use an empty string).
+- `note`: one short sentence (max 25 words) summarizing what the speaker said about industry growth or the company's outlook (forward-looking comment). If no outlook/growth comment exists, return an empty string.
 
 Transcript:
 \"\"\"
 {text}
 \"\"\"
 
-Provide your response as a single, valid JSON object with the following schema. Do not include any introductory text, apologies, or explanations outside of the JSON structure.
-{{
-  "executive_summary": "A concise, 3-5 sentence abstractive summary of the quarter.",
-  "key_financials": {{}},
-  "strategic_initiatives": [
-    "A bullet point list of key strategies discussed, such as new product launches or market expansions."
-  ],
-  "outlook_and_guidance": "A summary of management's forecast for the upcoming quarter or full year.",
-  "key_risks_mentioned": [
-    "A bullet point list of any risks or headwinds mentioned, such as supply chain issues or competitive pressures."
-  ]
-}}
+ - Detect all mentions of >30% growth in any key metric (revenue, profit, EBITDA, margins, etc.).
+ - For each growth mention, if possible, include the approximate **minute mark** in the call 
+   (based on textual cues like “earlier”, “later in the call”, or segment order).
+   If not inferable, set timestamp_seconds = null.
+   
+Return ONLY a JSON array of objects, each object exactly with the keys: `company_name`, `speaker`, `note`.
+Do NOT include any explanatory text, markdown, or extra fields. Example:
+[
+    {
+        "company_name": "Hindustan Petroleum Corporation Limited",
+        "speaker": "Vikas Sharma / CFO",
+        "note": "Management expects gradual margin recovery over the next two quarters."
+        "growth_mentions": [
+            {
+            "metric": "Revenue",
+            "growth_value": 42,
+            "context": "Revenue grew 42% YoY driven by retail and BFSI segments.",
+            "timestamp_seconds": 480, 
+            "type": "YoY",
+            "reliability": "High"
+            }
+        ]
+    }
+]
 """
 
 def summarise_with_gpt(text, PROMPT_TEMPLATE, api_key=None, model="gpt-5-mini", max_retries=3):
@@ -65,7 +81,7 @@ def summarise_with_gpt(text, PROMPT_TEMPLATE, api_key=None, model="gpt-5-mini", 
             time.sleep(5)
     return None
 
-@st.cache_data
+
 def generate_summary(transcript: str, api_key=None) -> dict:
     """
     Generates a financial summary using OpenAI GPT API.

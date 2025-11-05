@@ -266,65 +266,114 @@ def test_title_extraction(title: str):
     if not companies_info:
         print("No companies matched in database")
 
+def log_company_growth(summary_data, companies_info, video_url, title):
+    """
+    Logs one row per company summarizing >30% growth mentions, with timestamped links.
+    """
+    growth_mentions = summary_data.get("growth_mentions", [])
+    summary = summary_data.get("summary", {})
+
+    if not growth_mentions:
+        return
+
+    metric_summaries = []
+    context_snippets = []
+    timestamp_links = []
+
+    video_id = None
+    try:
+        from utils.transcription import extract_video_id
+        video_id = extract_video_id(video_url)
+    except Exception:
+        pass
+
+    for g in growth_mentions:
+        val = g.get("growth_value", 0)
+        if val <= 30:
+            continue
+
+        metric = g.get("metric", "Unknown")
+        metric_summaries.append(f"{metric} ({val}%)")
+
+        ctx = g.get("context", "").replace("\n", " ").strip()
+        context_snippets.append(ctx)
+
+        ts = g.get("timestamp_seconds", None)
+        if ts and isinstance(ts, (int, float)) and video_id:
+            timestamp_links.append(f"https://www.youtube.com/watch?v={video_id}&t={int(ts)}s")
+        elif video_id:
+            timestamp_links.append(video_url)  # fallback
+
+    if not metric_summaries:
+        return
+
+    company_name = (
+        companies_info[0].get('company_name', '') if companies_info
+        else summary.get('company_name', '')
+    )
+    isin = (
+        companies_info[0].get('isin', '') if companies_info
+        else ''
+    )
+
+    log_path = "growth_mentions_llm.xlsx"
+
+    if not os.path.exists(log_path):
+        df = pd.DataFrame(columns=[
+            "Company Name", "ISIN", "Metrics With >30% Growth",
+            "Growth Details", "Timestamped Links", "Video URL", "Title"
+        ])
+        df.to_excel(log_path, index=False)
+
+    df_existing = pd.read_excel(log_path)
+
+    new_entry = {
+        "Company Name": company_name,
+        "ISIN": isin,
+        "Metrics With >30% Growth": "; ".join(metric_summaries),
+        "Growth Details": " | ".join(context_snippets),
+        "Timestamped Links": "\n".join(timestamp_links),
+        "Video URL": video_url,
+        "Title": title
+    }
+
+    df_existing = pd.concat([df_existing, pd.DataFrame([new_entry])], ignore_index=True)
+    df_existing.to_excel(log_path, index=False)
+
+    print(f"✅ Logged growth summary for {company_name}: {len(metric_summaries)} metrics >30%")
+
 
 def format_summary_for_slack(url, summary, channel_id, title, companies_info):
+    # We expect `summary` to be a list of objects with keys: company_name, speaker, note
     lines = []
     lines.append(f"*Summary for channel:* `{channel_id}`\n<{url}>")
     lines.append(f"*Video Title:* {title}")
-    
-    if companies_info:
-        lines.append("*Detected Companies:*")
-        for company_info in companies_info:
-            company_line = f"• {company_info['company_name']}"
-            if company_info.get('isin'):
-                company_line += f" (ISIN: {company_info['isin']})"
-            if company_info.get('nse_symbol'):
-                company_line += f" (NSE: {company_info['nse_symbol']})"
-            lines.append(company_line)
-        lines.append("")
-    
-    # Executive Summary - only add if exists and not empty
-    exec_summary = summary.get('executive_summary')
-    if exec_summary and exec_summary.strip() and exec_summary.lower() != 'n/a':
-        lines.append(f"*Executive Summary:*\n{exec_summary}\n")
 
-    # Key Financials - only add if exists and not empty
-    key_financials = summary.get("key_financials", {})
-    if key_financials and key_financials != {} and key_financials != "N/A":
-        lines.append("*Key Financials:*")
-        for section, details in key_financials.items():
-            if details and details != "N/A":  # Skip empty/N/A details
-                lines.append(f"• *{section.replace('_', ' ').title()}*")
-                if isinstance(details, dict):
-                    for k, v in details.items():
-                        if v and v != "N/A":  # Skip empty/N/A values
-                            lines.append(f"    - {k.replace('_', ' ').title()}: {v}")
-                else:
-                    lines.append(f"    - {details}")
-        lines.append("")
+    if isinstance(summary, list) and summary:
+        # Match summary entries to companies_info by company_name (fuzzy if needed)
+        for entry in summary:
+            cname = entry.get('company_name', '').strip()
+            speaker = entry.get('speaker', '').strip()
+            note = entry.get('note', '').strip()
 
-    # Strategic Initiatives - only add if exists and not empty
-    initiatives = summary.get("strategic_initiatives", [])
-    if initiatives and initiatives != ["N/A"] and any(item for item in initiatives if item and item.strip()):
-        lines.append("*Strategic Initiatives:*")
-        for item in initiatives:
-            if item and item.strip() and item.lower() != 'n/a':
-                lines.append(f"• {item}")
-        lines.append("")
+            # Find ISIN from companies_info if available
+            isin = ''
+            for c in companies_info:
+                if c.get('company_name') and cname.lower() == c.get('company_name').lower():
+                    isin = c.get('isin', '')
+                    break
 
-    # Outlook and Guidance - only add if exists and not empty
-    outlook = summary.get("outlook_and_guidance")
-    if outlook and outlook.strip() and outlook.lower() != 'n/a':
-        lines.append(f"*Outlook and Guidance:*\n{outlook}\n")
+            line = f"• {cname}"
+            if isin:
+                line += f" (ISIN: {isin})"
+            if speaker:
+                line += f" — {speaker}"
+            if note:
+                line += f" — {note}"
 
-    # Key Risks - only add if exists and not empty
-    risks = summary.get("key_risks_mentioned", [])
-    if risks and risks != ["N/A"] and any(risk for risk in risks if risk and risk.strip()):
-        lines.append("*Key Risks Mentioned:*")
-        for risk in risks:
-            if risk and risk.strip() and risk.lower() != 'n/a':
-                lines.append(f"• {risk}")
-        lines.append("")
+            lines.append(line)
+    else:
+        lines.append("No concise summaries available.")
 
     return "\n".join(lines)
 
@@ -355,6 +404,16 @@ def main():
                 try:
                     transcript = get_transcript(url)
                     summary = generate_summary(transcript)
+                    
+                    # Log all >30% growth mentions (if any)
+                    try:
+                        # Loop through all company summaries
+                        for entry in summary:
+                            if "growth_mentions" in entry and entry["growth_mentions"]:
+                                log_company_growth(entry, companies_info, url, title)
+                    except Exception as e:
+                        print(f"⚠️ Error logging growth data: {e}")
+
                     summary_text = format_summary_for_slack(url, summary, channel_id, title, companies_info)
                     send_to_slack(summary_text)
                     visited_videos.add(url)
@@ -365,201 +424,5 @@ def main():
         save_visited(visited_videos)
         time.sleep(600)  # Wait 10 minutes before checking again
 
-def test_single_video(video_url: str, test_title: str = None):
-    """
-    Test function to process a single video URL for debugging purposes.
-    Can optionally use a provided title instead of extracting from transcript.
-    """
-    print(f"Testing video: {video_url}")
-    
-    try:
-        # Use provided title or extract from transcript
-        if test_title:
-            print(f"Using provided title: {test_title}")
-            title_for_extraction = test_title
-        else:
-            # Extract from transcript as fallback
-            transcript = get_transcript(video_url)
-            if not transcript:
-                print("Could not get transcript and no title provided")
-                return
-            title_for_extraction = transcript[:200] + "..."
-            print(f"Using transcript preview as title: {title_for_extraction}")
-        
-        # Extract companies using GPT
-        print("\n--- GPT Company Extraction ---")
-        gpt_companies = extract_companies_with_gpt(title_for_extraction)
-        print(f"GPT extracted companies: {gpt_companies}")
-        
-        if not gpt_companies:
-            print("No companies found by GPT")
-            return
-        
-        # Find companies in our Excel data
-        print("\n--- Company Matching ---")
-        companies_info = find_companies_in_data(gpt_companies)
-        print(f"Matched companies in database: {len(companies_info)}")
-        
-        for company in companies_info:
-            print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
-        
-        if not companies_info:
-            print("No companies matched in database")
-            return
-        
-        # Get transcript for summary generation
-        if not test_title:  # We already have transcript
-            pass
-        else:
-            print("\n--- Getting Transcript ---")
-            transcript = get_transcript(video_url)
-            if not transcript:
-                print("Could not get transcript for summary generation")
-                return
-        
-        # Generate summary
-        print("\n--- Generating Summary ---")
-        summary = generate_summary(transcript)
-        
-        # Format for Slack
-        final_title = test_title if test_title else title_for_extraction
-        summary_text = format_summary_for_slack(video_url, summary, "TEST_CHANNEL", final_title, companies_info)
-        
-        print("\n--- Final Slack Message ---")
-        print(summary_text)
-        
-        # Optionally send to Slack (uncomment if you want to test)
-        # send_to_slack(summary_text)
-        
-    except Exception as e:
-        print(f"Error testing video: {e}")
-        import traceback
-        traceback.print_exc()
-
-def test_comprehensive(video_url: str = None, title: str = None):
-    """
-    Comprehensive test function that can handle video URL, title, or both.
-    """
-    if not video_url and not title:
-        print("Please provide either a video URL, title, or both")
-        return
-    
-    if title:
-        print(f"Testing title: '{title}'")
-        
-        # Extract companies using GPT
-        print("\n--- GPT Company Extraction ---")
-        gpt_companies = extract_companies_with_gpt(title)
-        print(f"GPT extracted companies: {gpt_companies}")
-        
-        if not gpt_companies:
-            print("No companies found by GPT")
-            if not video_url:
-                return
-        else:
-            # Find companies in our Excel data
-            print("\n--- Company Matching ---")
-            companies_info = find_companies_in_data(gpt_companies)
-            print(f"Matched companies in database: {len(companies_info)}")
-            
-            for company in companies_info:
-                print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
-    
-    if video_url:
-        print(f"\nTesting video processing: {video_url}")
-        try:
-            # Get transcript
-            print("\n--- Getting Transcript ---")
-            transcript = get_transcript(video_url)
-            if not transcript:
-                print("Could not get transcript")
-                return
-            
-            # If we have companies from title, use them; otherwise extract from transcript
-            if title and 'gpt_companies' in locals() and gpt_companies:
-                print("\n--- Using companies from title ---")
-            else:
-                print("\n--- Extracting companies from transcript ---")
-                # Use first part of transcript for company extraction
-                transcript_preview = transcript[:500]
-                gpt_companies = extract_companies_with_gpt(transcript_preview)
-                print(f"GPT extracted companies: {gpt_companies}")
-                
-                if not gpt_companies:
-                    print("No companies found in transcript")
-                    return
-                
-                companies_info = find_companies_in_data(gpt_companies)
-                print(f"Matched companies in database: {len(companies_info)}")
-                
-                for company in companies_info:
-                    print(f"  - {company['company_name']} (ISIN: {company.get('isin', 'N/A')})")
-            
-            if not companies_info:
-                print("No companies matched in database")
-                return
-            
-            # Generate summary
-            print("\n--- Generating Summary ---")
-            summary = generate_summary(transcript)
-            
-            # Format for Slack
-            final_title = title if title else "Test Video"
-            summary_text = format_summary_for_slack(video_url, summary, "TEST_CHANNEL", final_title, companies_info)
-            
-            print("\n--- Final Slack Message ---")
-            print(summary_text)
-            
-        except Exception as e:
-            print(f"Error processing video: {e}")
-            import traceback
-            traceback.print_exc()
-
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "test_video" and len(sys.argv) > 2:
-            # Test a single video with optional title
-            video_url = sys.argv[2]
-            title = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else None
-            test_single_video(video_url, title)
-        elif sys.argv[1] == "test_title" and len(sys.argv) > 2:
-            # Test title extraction only
-            test_title = " ".join(sys.argv[2:])
-            test_title_extraction(test_title)
-        elif sys.argv[1] == "test" and len(sys.argv) > 2:
-            # Comprehensive test - can handle various combinations
-            args = sys.argv[2:]
-            video_url = None
-            title = None
-            
-            # Parse arguments
-            i = 0
-            while i < len(args):
-                if args[i] == "--url" and i + 1 < len(args):
-                    video_url = args[i + 1]
-                    i += 2
-                elif args[i] == "--title" and i + 1 < len(args):
-                    # Get the rest as title
-                    title = " ".join(args[i + 1:])
-                    break
-                elif args[i].startswith("http"):
-                    video_url = args[i]
-                    i += 1
-                else:
-                    # Assume it's part of the title
-                    title = " ".join(args[i:])
-                    break
-            
-            test_comprehensive(video_url, title)
-        else:
-            print("Usage:")
-            print("  python auto.py test_video <youtube_url> [title]")
-            print("  python auto.py test_title <title_text>")
-            print("  python auto.py test --url <youtube_url> --title <title_text>")
-            print("  python auto.py test <youtube_url>")
-            print("  python auto.py test --title <title_text>")
-    else:
-        # Run normal main function
-        main()        
+    main()        
