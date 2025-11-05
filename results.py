@@ -4,6 +4,9 @@ import time
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+import schedule
+import time
+
 
 load_dotenv()
 
@@ -96,6 +99,15 @@ def send_summary_report():
     save_sent_log(new_sent_log)
     print("✅ Summary report sent successfully.")
 
-
 if __name__ == "__main__":
-    send_summary_report()
+    # Schedule the job twice per day
+    schedule.every().day.at("09:00").do(send_summary_report)
+    schedule.every().day.at("19:00").do(send_summary_report)
+
+    print("⏰ Scheduler running... Will send summary at 9:00 AM and 7:00 PM daily.")
+
+    # Keep the script running
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Check every minute
+
